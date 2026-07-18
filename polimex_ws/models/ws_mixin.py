@@ -142,6 +142,61 @@ class PolimexWsMixin(models.AbstractModel):
         self.sudo().write({"ws_last_seen": fields.Datetime.now()})
 
     # ------------------------------------------------------------------
+    # Shared-endpoint delegation (host models only). A host (webstack /
+    # gateway) delegates its credential + presence to ONE polimex.ws.endpoint
+    # per serial, so a device that is both an AC webstack and an IoT gateway
+    # shares ONE key (the double-key fix). The endpoint model has no
+    # ``endpoint_id`` field, so these overrides are inert on it.
+    # ------------------------------------------------------------------
+    @api.model_create_multi
+    def create(self, vals_list):
+        if "endpoint_id" in self._fields:
+            Endpoint = self.env["polimex.ws.endpoint"].sudo()
+            # Delegated writable fields (key, ws_enabled, ...) minus serial (the
+            # host keeps its own) and the computed/magic ones. When we pre-set
+            # endpoint_id, Odoo no longer auto-writes these delegated values from
+            # the host vals (it only does that when IT auto-creates the delegate),
+            # so we move them onto the shared endpoint ourselves.
+            deleg = {
+                name for name, f in Endpoint._fields.items()
+                if getattr(f, "store", False) and not f.compute and not f.related
+                and name not in (
+                    "id", "serial", "display_name", "create_uid", "create_date",
+                    "write_uid", "write_date", "__last_update")
+            }
+            for vals in vals_list:
+                if vals.get("endpoint_id"):
+                    continue
+                serial = vals.get("serial")
+                if not serial:
+                    # No serial yet (rare manual create) -> _inherits will
+                    # auto-create a fresh, private endpoint for this host.
+                    continue
+                endpoint = Endpoint._ws_get_or_create(str(serial))
+                ep_vals = {k: vals.pop(k) for k in list(vals) if k in deleg}
+                if ep_vals:
+                    endpoint.write(ep_vals)
+                vals["endpoint_id"] = endpoint.id
+        return super().create(vals_list)
+
+    def write(self, vals):
+        res = super().write(vals)
+        # Serial assigned/changed after create (e.g. discovery fills it in on a
+        # placeholder record): dedup onto the shared endpoint for that serial.
+        # Rare (serial is readonly + the real flows create WITH a serial), so
+        # this only repoints; an orphaned serial-less placeholder endpoint is
+        # harmless and swept by the endpoint autovacuum.
+        if "endpoint_id" in self._fields and vals.get("serial"):
+            Endpoint = self.env["polimex.ws.endpoint"].sudo()
+            for rec in self:
+                if not rec.serial:
+                    continue
+                shared = Endpoint._ws_get_or_create(str(rec.serial))
+                if rec.endpoint_id.id != shared.id:
+                    rec.sudo().endpoint_id = shared.id
+        return res
+
+    # ------------------------------------------------------------------
     # Channel lifecycle
     # ------------------------------------------------------------------
     def action_ws_enable(self):

@@ -4,7 +4,7 @@
     "summary": "Shared secure-websocket transport base (device hello/HMAC auth, "
                "anti-replay, TOFU re-key, bus publish and tunnel ingress) reused "
                "by hr_rfid Access Control and Polimex IoT.",
-    "version": "19.0.1.0.0",
+    "version": "19.0.1.1.0",
     "category": "Technical",
     "author": "Polimex Dev Team",
     "website": "https://polimex.co",
@@ -15,5 +15,7 @@
     # is referenced here - both domain modules depend on THIS one, never on each
     # other (two-independent-functions law).
     "depends": ["mail", "bus"],
-    "data": [],
+    "data": [
+        "security/ir.model.access.csv",
+    ],
 }

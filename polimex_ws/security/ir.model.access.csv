@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_polimex_ws_endpoint_user,polimex.ws.endpoint.user,model_polimex_ws_endpoint,base.group_user,1,1,1,0
+access_polimex_ws_endpoint_system,polimex.ws.endpoint.system,model_polimex_ws_endpoint,base.group_system,1,1,1,1

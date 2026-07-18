@@ -1,0 +1,114 @@
+# Polimex Holding Ltd. - https://polimex.co
+"""The shared per-serial credential + presence row (``polimex.ws.endpoint``).
+
+ONE row per physical device serial. Both host models (``hr.rfid.webstack`` and
+``polimex.iot.gateway``) delegate their real-time credential and presence to it
+via ``_inherits`` and a get-or-create-by-serial ``create`` override, so a single
+physical device that serves BOTH access-control controllers AND an IoT tunnel has
+exactly ONE key and ONE presence watermark - fixing the double-credential drift
+that a per-host key produced when the two diverged.
+
+The row carries only the transport credential/presence (key + ws_* state); the
+device's business identity (name, company, controllers, wired serial devices)
+stays on the host records. It inherits ``polimex.ws.mixin`` purely to reuse the
+presence compute/search + the config-parameter helpers - the transport dispatch
+methods on the mixin are never called on an endpoint (they run on the hosts).
+"""
+from odoo import api, fields, models
+
+
+class PolimexWsEndpoint(models.Model):
+    _name = "polimex.ws.endpoint"
+    _inherit = ["polimex.ws.mixin"]
+    _description = "Polimex WebSocket Endpoint (per-serial shared credential)"
+    _order = "serial"
+
+    # serial is the dedup key: one endpoint per physical serial. NOT required -
+    # a host created without a serial yet (rare manual case) gets its own fresh
+    # endpoint (serial NULL; Postgres UNIQUE permits many NULLs); the real
+    # register/discovery flows always create the host WITH a serial, so they
+    # dedup through the create override. UNIQUE guarantees one row per serial.
+    serial = fields.Char(
+        string="Serial number",
+        index=True,
+        help="The physical device serial this credential belongs to.",
+    )
+    _serial_uniq = models.Constraint(
+        "UNIQUE(serial)",
+        "A websocket endpoint for this serial already exists.")
+
+    # default='0000': this is the ACCESS-CONTROL historical default and it is a
+    # HARD dependency - the AC HTTP auth (_authenticate_webstack) and the WS
+    # dispatch match a fresh module against '0000' until it is changed, and the
+    # AC test-suite fixtures rely on it. IoT gateways that want trust-on-first-use
+    # from a keyless state clear the key (action_ws_rekey -> False), after which
+    # the secure hello adopts the device's presented key (TOFU); a re-key still
+    # works, only a FRESH endpoint now starts at '0000' instead of keyless.
+    # No tracking= here: the endpoint is not a mail.thread. The hosts (webstack /
+    # gateway) are mail.thread and post their own audit notes on key/enable
+    # changes through the mixin's action_ws_* / _ws_check_hello.
+    key = fields.Char(
+        string="Key",
+        size=4,
+        index=True,
+        default="0000",
+        help="Security key for device authentication - the channel credential "
+             "the device presents on the real-time connection.",
+    )
+
+    # ------------------------------------------------------------------
+    # Real-time presence / anti-replay / anti-flood (shared across the hosts).
+    # The compute/search behind ws_online lives in polimex.ws.mixin.
+    # ------------------------------------------------------------------
+    ws_enabled = fields.Boolean(
+        string="Real-time Channel",
+        help="Whether the permanent real-time connection is enabled for this "
+             "device.",
+        default=False,
+    )
+    ws_proto = fields.Integer(
+        string="Protocol Version",
+        readonly=True,
+        copy=False,
+        help="Real-time protocol version negotiated on the last connection.",
+    )
+    ws_last_seen = fields.Datetime(
+        string="Last Real-time Activity",
+        readonly=True,
+        copy=False,
+        help="Last time the device sent anything over the real-time link.",
+    )
+    ws_online = fields.Boolean(
+        string="Real-time Online",
+        compute="_compute_ws_online",
+        search="_search_ws_online",
+        help="The device is currently connected in real time (activity within "
+             "the last two heartbeat intervals).",
+    )
+    ws_provision_pending = fields.Boolean(
+        string="Settings Pending Delivery",
+        copy=False,
+        help="The real-time settings changed and will be delivered on the next "
+             "check-in.",
+    )
+    ws_auth_fail_count = fields.Integer(copy=False)
+    ws_auth_fail_since = fields.Datetime(copy=False)
+    # Anti-replay watermark for the secure hello: the highest `n`
+    # (boot_count*65536 + seq) this device has proven; a hello with
+    # n <= ws_last_n is a replay and is refused.
+    ws_last_n = fields.Integer(copy=False, default=0)
+
+    @api.model
+    def _ws_get_or_create(self, serial):
+        """Return the single endpoint for ``serial``, creating it if absent.
+        Race-safe: a concurrent create that wins the UNIQUE(serial) is caught
+        and the winner is re-read. Called from the host create/write overrides
+        so one serial maps to exactly one endpoint (the double-key fix)."""
+        endpoint = self.sudo().search([("serial", "=", serial)], limit=1)
+        if endpoint:
+            return endpoint
+        try:
+            with self.env.cr.savepoint():
+                return self.sudo().create({"serial": serial})
+        except Exception:  # UNIQUE(serial) race - a concurrent create won
+            return self.sudo().search([("serial", "=", serial)], limit=1)
