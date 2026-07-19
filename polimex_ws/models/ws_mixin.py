@@ -384,7 +384,19 @@ class PolimexWsMixin(models.AbstractModel):
                          "hello from %s", rec.serial)
             return False
         if not rec.key:
-            # TOFU: adopt the HMAC-proven key for a keyless / re-keyed device.
+            if not wire_k or str(wire_k) == "0000":
+                # NEVER adopt the insecure '0000' (or an empty) key (owner + FW,
+                # 2026-07-19): the firmware mints a NON-zero credential, so a
+                # keyless device presenting '0000' is unprovisioned. Leave it
+                # keyless (flagged needs-provisioning) and refuse the hello, so
+                # the device falls back to HTTP until it presents a real key.
+                _logger.warning(
+                    "WS: device %s presented the insecure key %r on an "
+                    "authenticated hello - NOT adopting it; the device needs "
+                    "provisioning with a real generated key.", rec.serial, wire_k)
+                return False
+            # TOFU: adopt the HMAC-proven, non-zero key for a keyless / re-keyed
+            # device.
             rec.key = wire_k
             _logger.info("WS: adopted key for device %s on an authenticated "
                          "hello (TOFU re-key)", rec.serial)

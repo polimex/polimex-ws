@@ -37,24 +37,44 @@ class PolimexWsEndpoint(models.Model):
         "UNIQUE(serial)",
         "A websocket endpoint for this serial already exists.")
 
-    # default='0000': this is the ACCESS-CONTROL historical default and it is a
-    # HARD dependency - the AC HTTP auth (_authenticate_webstack) and the WS
-    # dispatch match a fresh module against '0000' until it is changed, and the
-    # AC test-suite fixtures rely on it. IoT gateways that want trust-on-first-use
-    # from a keyless state clear the key (action_ws_rekey -> False), after which
-    # the secure hello adopts the device's presented key (TOFU); a re-key still
-    # works, only a FRESH endpoint now starts at '0000' instead of keyless.
-    # No tracking= here: the endpoint is not a mail.thread. The hosts (webstack /
-    # gateway) are mail.thread and post their own audit notes on key/enable
-    # changes through the mixin's action_ws_* / _ws_check_hello.
+    # default=False (UNPROVISIONED) - NOT '0000' (owner + FW-Q26, 2026-07-19).
+    # '0000' is a legacy/insecure placeholder, never a valid minted credential
+    # (the firmware derives a NON-zero MAC key on reset). A fresh endpoint is
+    # therefore keyless: it adopts the device's presented key on the first
+    # authenticated hello (TOFU) - but ONLY a NON-zero key (a device presenting
+    # '0000' is left unprovisioned, never adopted; see the mixin _ws_check_hello /
+    # the AC HTTP auth). An EXISTING '0000' credential still auth-matches (a
+    # legacy field device keeps working) but is flagged needs-provisioning.
+    # No tracking= here: the endpoint is not a mail.thread; the hosts post audit
+    # notes through the mixin's action_ws_* / _ws_check_hello.
     key = fields.Char(
         string="Key",
         size=4,
         index=True,
-        default="0000",
+        default=False,
         help="Security key for device authentication - the channel credential "
-             "the device presents on the real-time connection.",
+             "the device presents on the real-time connection. Blank or 0000 = "
+             "not securely provisioned.",
     )
+    ws_needs_provisioning = fields.Boolean(
+        string="Needs provisioning",
+        compute="_compute_ws_needs_provisioning",
+        search="_search_ws_needs_provisioning",
+        help="The device has no secure key yet (blank or the insecure 0000 "
+             "placeholder). Re-key it so it presents a real generated credential.",
+    )
+
+    @api.depends("key")
+    def _compute_ws_needs_provisioning(self):
+        for rec in self:
+            rec.ws_needs_provisioning = rec.key in (False, "", "0000")
+
+    def _search_ws_needs_provisioning(self, operator, value):
+        if operator not in ("=", "!=") or not isinstance(value, bool):
+            return NotImplemented
+        insecure = [("key", "in", [False, "", "0000"])]
+        needs = (operator == "=") == value
+        return insecure if needs else (["!"] + insecure)
 
     # ------------------------------------------------------------------
     # Real-time presence / anti-replay / anti-flood (shared across the hosts).
