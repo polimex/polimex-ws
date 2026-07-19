@@ -28,9 +28,11 @@ class PolimexWsEndpoint(models.Model):
     # endpoint (serial NULL; Postgres UNIQUE permits many NULLs); the real
     # register/discovery flows always create the host WITH a serial, so they
     # dedup through the create override. UNIQUE guarantees one row per serial.
+    # No index=True: the UNIQUE(serial) constraint below already provides the
+    # btree index (core convention - cf. ir_config_parameter.key); index=True
+    # would build a second redundant index on the same column.
     serial = fields.Char(
         string="Serial number",
-        index=True,
         help="The physical device serial this credential belongs to.",
     )
     _serial_uniq = models.Constraint(
