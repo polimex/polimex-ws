@@ -4,7 +4,7 @@
     "summary": "Shared secure-websocket transport base (device hello/HMAC auth, "
                "anti-replay, TOFU re-key, bus publish and tunnel ingress) reused "
                "by hr_rfid Access Control and Polimex IoT.",
-    "version": "19.0.1.2.1",
+    "version": "19.0.1.3.0",
     "category": "Technical",
     "author": "Polimex Dev Team",
     "website": "https://polimex.co",

@@ -291,13 +291,28 @@ class PolimexWsMixin(models.AbstractModel):
         key_ok = (device and device.key
                   and consteq(device.key.upper(), str(k).upper()))
         tofu_hello = bool(mtype == "hello" and device and not device.key)
+        # G1 heal: a device whose STORED key is the insecure '0000' placeholder
+        # may send a hello even with a DIFFERENT key - the secure hello then
+        # either re-keys it (firmware healed 0000 -> MAC key; HMAC-gated inside
+        # _ws_check_hello) or keeps it 0000. A REAL stored key is never
+        # overridable this way (a key mismatch on a provisioned device stays
+        # refused). This lets the firmware auto-heal land with no per-device step.
+        heal_hello = bool(mtype == "hello" and device
+                          and str(device.key or "") == "0000")
         if (not device or not device.active or not device.ws_enabled
-                or not (key_ok or tofu_hello)):
+                or not (key_ok or tofu_hello or heal_hello)):
             self._ws_auth_failed(device, mtype)
             if mtype == "hello":
                 self._ws_nack_hello(serial, k, device)
             return
-        device._ws_touch()
+        # A KEY-MATCHED frame is already authenticated -> stamp presence now (this
+        # covers non-hello frames + a proto-mismatch or replayed hello from a
+        # known device). A hello that only passed the gate via tofu/heal is
+        # UNVERIFIED until _ws_check_hello, so it must NOT touch presence yet - an
+        # unproven key (incl. a heal_hello whose HMAC fails) would otherwise stamp
+        # a device it never authenticated (SPEC §9.2: auth failure = no presence).
+        if key_ok:
+            device._ws_touch()
         proto = data.get("v")
         if proto not in WS_PROTO_SUPPORTED:
             # Unsupported protocol: answer only a hello (SPEC §9.2), drop
@@ -308,10 +323,13 @@ class PolimexWsMixin(models.AbstractModel):
             return
         if mtype == "hello" and not device._ws_check_hello(data):
             # The secure-hello identity (firmware HMAC + counter, + key adoption
-            # on TOFU) did not hold - same refusal shape as a bad key.
+            # on TOFU / 0000 heal) did not hold - same refusal shape as a bad key.
             self._ws_auth_failed(device, mtype)
             self._ws_nack_hello(serial, k, device)
             return
+        if not key_ok:
+            # a tofu/heal hello whose secure identity just held -> stamp presence.
+            device._ws_touch()
         handler = device._ws_handlers().get(mtype)
         if handler is None:
             _logger.debug("WS: unknown message type %r from %s", mtype, serial)
@@ -361,9 +379,14 @@ class PolimexWsMixin(models.AbstractModel):
                 "WS: %s is not set - accepting hello from %s WITHOUT the "
                 "firmware authenticity check. Set the parameter in "
                 "production.", WS_FW_SECRET_PARAM, rec.serial)
-            # No proof: an already-keyed device passes (its key matched in the
-            # dispatcher); a keyless device cannot be adopted without a proof.
-            return bool(rec.key)
+            # No proof to verify a key adoption/heal: pass ONLY when the presented
+            # key already MATCHES the stored one (an established device). A keyless
+            # TOFU adoption OR a legacy-0000 -> new-key HEAL is a key CHANGE and
+            # must NOT proceed without the HMAC (a 0000 device is reachable via
+            # heal_hello even with a different key, so bool(rec.key) alone would
+            # wrongly accept an unproven re-key).
+            return bool(rec.key) and consteq(
+                str(rec.key).upper(), wire_k.upper())
         try:
             n = int(data.get("n"))
         except (TypeError, ValueError):
@@ -383,23 +406,33 @@ class PolimexWsMixin(models.AbstractModel):
             _logger.info("WS: firmware authenticity check did not pass for "
                          "hello from %s", rec.serial)
             return False
-        if not rec.key:
+        # Adopt / TOFU / HEAL. A device with NO stored key (never provisioned) OR
+        # the insecure '0000' placeholder adopts the HMAC-proven NON-zero key it
+        # presents - onto the SAME endpoint, preserving the serial mapping + the
+        # advancing anti-replay watermark. This is how the firmware G1 auto-heal
+        # (0000 -> MAC key) lands with no per-device cloud step: the healed device
+        # just presents its new key. NEVER adopt '0000' (owner + FW-Q26/27): a
+        # device still presenting '0000' stays unprovisioned (flagged); a keyless
+        # device presenting '0000' cannot come online and is refused.
+        if not rec.key or str(rec.key) == "0000":
             if not wire_k or str(wire_k) == "0000":
-                # NEVER adopt the insecure '0000' (or an empty) key (owner + FW,
-                # 2026-07-19): the firmware mints a NON-zero credential, so a
-                # keyless device presenting '0000' is unprovisioned. Leave it
-                # keyless (flagged needs-provisioning) and refuse the hello, so
-                # the device falls back to HTTP until it presents a real key.
-                _logger.warning(
-                    "WS: device %s presented the insecure key %r on an "
-                    "authenticated hello - NOT adopting it; the device needs "
-                    "provisioning with a real generated key.", rec.serial, wire_k)
-                return False
-            # TOFU: adopt the HMAC-proven, non-zero key for a keyless / re-keyed
-            # device.
-            rec.key = wire_k
-            _logger.info("WS: adopted key for device %s on an authenticated "
-                         "hello (TOFU re-key)", rec.serial)
+                if not rec.key:
+                    _logger.warning(
+                        "WS: device %s presented the insecure key %r on an "
+                        "authenticated hello - NOT adopting; the device needs "
+                        "provisioning with a real generated key.",
+                        rec.serial, wire_k)
+                    return False
+                # legacy '0000' device still presenting '0000' (not yet healed):
+                # keep it working, still flagged needs-provisioning.
+            elif rec.key:
+                _logger.info("WS: healed device %s from the insecure 0000 to a "
+                             "real key on an authenticated hello (G1)", rec.serial)
+                rec.key = wire_k
+            else:
+                _logger.info("WS: adopted key for device %s on an authenticated "
+                             "hello (TOFU)", rec.serial)
+                rec.key = wire_k
         rec.ws_last_n = n
         return True
 
