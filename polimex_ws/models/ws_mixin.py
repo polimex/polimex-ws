@@ -69,6 +69,21 @@ WS_RL = {"rate": 5, "burst": 8}
 WS_AUTH_FAIL_THRESHOLD = 5
 WS_AUTH_FAIL_WINDOW_S = 60
 
+# Transaction-scoped dedup of the per-frame secure-hello validation. On a
+# co-installed system (AC + IoT) BOTH ir.websocket ingress overrides claim the
+# SAME wire hello (hr_rfid by event_name, polimex_iot by the ``ch`` list) and
+# both host models dispatch it against ONE shared endpoint whose delegated
+# ``ws_last_n`` watermark the FIRST branch's validation advances - so a naive
+# re-validation by the SECOND branch false-rejects (n <= last) and auth-nacks a
+# valid hello; the device, subscribed to both prefixes, receives ok + nack and
+# parks to HTTP (live 463636 bench bug, 2026-07-24). The verdict of a frame's
+# crypto validation therefore lives under this key in ``cr.precommit.data``
+# (server-side transaction scratch - NEVER derived from the wire dict: a device
+# able to pre-set a marker would skip the HMAC entirely), holding a set of
+# ``(endpoint_id, n, auth)`` tuples so a marker can never match a different
+# frame. "Validate once, handle N times."
+WS_HELLO_VALIDATED_KEY = "polimex_ws.hello_validated"
+
 # ---------------------------------------------------------------------------
 # FW-pinned wire TYPE literals. INV-1 (FW answer Q2, PERMANENT): the FW
 # down_type() map (esp32 modules/OdooWs) knows ONLY the hr_rfid.* type literals
@@ -350,11 +365,55 @@ class PolimexWsMixin(models.AbstractModel):
             self._ws_report_sys_ev(
                 device, "Real-time message could not be processed",
                 {"t": mtype})
+        if mtype == "hello" and self._ws_fw_secret():
+            # Re-arm the per-frame validation marker for the SIBLING branch of
+            # a co-installed system: the handler savepoint above just wiped
+            # precommit.data (exit flush runs the queued bus precommit
+            # callback; a rollback runs cr.clear()). Reaching this point means
+            # the hello VALIDATED; gated on the secret so an unverified
+            # no-secret hello never mints a marker (whose short-circuit path
+            # would advance the watermark from an unproven n).
+            device._ws_hello_mark_validated(data)
 
     def _ws_fw_secret(self):
         """The build-wide FW_SECRET (canonical param, then legacy fallbacks)."""
         return self._ws_get_param(
             WS_FW_SECRET_PARAM, WS_FW_SECRET_PARAM_FALLBACKS, False)
+
+    def _ws_hello_frame_id(self, data):
+        """Identity of a hello wire frame for the transaction-scoped validation
+        dedup (WS_HELLO_VALIDATED_KEY): ``(shared endpoint id, n, auth)``. The
+        endpoint id is SERVER-resolved (never the wire serial - and never the
+        host record id: the two hosts of one serial have different ids but
+        delegate the watermark to ONE endpoint); n + auth bind the marker to
+        the exact signed frame so it can never match a different one. Returns
+        None when the frame has no parseable counter (nothing to dedup - the
+        malformed-counter guard rejects such a frame)."""
+        self.ensure_one()
+        rec = self.sudo()
+        endpoint_id = (
+            rec.endpoint_id.id if "endpoint_id" in rec._fields else rec.id)
+        try:
+            n = int(data.get("n"))
+        except (TypeError, ValueError):
+            return None
+        return (endpoint_id, n, str(data.get("auth") or "").lower())
+
+    def _ws_hello_mark_validated(self, data):
+        """Record this frame's successful secure validation for the rest of
+        the transaction (see WS_HELLO_VALIDATED_KEY). Called on the genuine
+        success path of :meth:`_ws_check_hello` AND re-armed by the dispatcher
+        after the handler savepoint: the savepoint's exit flush runs queued
+        precommit callbacks (``bus._sendone`` defers the ack row insert to
+        one) and ``Callbacks.run()``/``clear()`` wipe ``precommit.data`` with
+        them - as does a failed handler's rollback (``cr.clear()``). Without
+        the re-arm the sibling branch would false-nack again on exactly those
+        paths (odoo/sql_db.py ``_FlushingSavepoint``, tools/misc.py
+        ``Callbacks``)."""
+        frame_id = self._ws_hello_frame_id(data)
+        if frame_id:
+            self.env.cr.precommit.data.setdefault(
+                WS_HELLO_VALIDATED_KEY, set()).add(frame_id)
 
     def _ws_check_hello(self, data):
         """Secure-hello identity for proto 3 (SPEC §5.1).
@@ -387,6 +446,21 @@ class PolimexWsMixin(models.AbstractModel):
             # wrongly accept an unproven re-key).
             return bool(rec.key) and consteq(
                 str(rec.key).upper(), wire_k.upper())
+        frame_id = self._ws_hello_frame_id(data)
+        if frame_id and frame_id in self.env.cr.precommit.data.get(
+                WS_HELLO_VALIDATED_KEY, ()):
+            # This exact frame (same endpoint, n AND auth) was already
+            # crypto-verified by the OTHER branch of a co-installed system in
+            # THIS transaction; the shared watermark already covers its n, so
+            # a re-validation would false-reject (n <= last) and nack a valid
+            # hello (the 463636 double-branch park bug). Validation is
+            # per-FRAME; the per-branch hello handling still runs. Adoption
+            # (TOFU/heal) already happened endpoint-level on the first pass.
+            # Belt-and-braces: re-assert the watermark idempotently in case a
+            # desync path left it behind the marker.
+            if rec.ws_last_n < frame_id[1]:
+                rec.ws_last_n = frame_id[1]
+            return True
         # Every hello REJECTION below is logged LOUDLY (WARNING) with the exact
         # reason + the values needed to diagnose it. A refused hello of a
         # provisioned device is actionable (a secret/key/watermark mismatch, not
@@ -452,6 +526,7 @@ class PolimexWsMixin(models.AbstractModel):
                              "hello (TOFU)", rec.serial)
                 rec.key = wire_k
         rec.ws_last_n = n
+        self._ws_hello_mark_validated(data)
         return True
 
     @api.model
