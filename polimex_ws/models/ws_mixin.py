@@ -387,15 +387,29 @@ class PolimexWsMixin(models.AbstractModel):
             # wrongly accept an unproven re-key).
             return bool(rec.key) and consteq(
                 str(rec.key).upper(), wire_k.upper())
+        # Every hello REJECTION below is logged LOUDLY (WARNING) with the exact
+        # reason + the values needed to diagnose it. A refused hello of a
+        # provisioned device is actionable (a secret/key/watermark mismatch, not
+        # random network noise - rec is an already-resolved device), and the
+        # device retries only on its reprobe cadence, so this does not flood.
+        # Rationale (2026-07-22, bench): a silent INFO here sent BOTH sides
+        # chasing "the WS closes before hello" for hours while the real cause was
+        # an anti-replay reject; the firmware only ever sees a generic
+        # "hello_ack auth-fail", so Odoo MUST name the true reason.
         try:
             n = int(data.get("n"))
         except (TypeError, ValueError):
-            _logger.info("WS: hello from %s with a malformed counter %r",
-                         rec.serial, data.get("n"))
+            _logger.warning("WS: hello REJECTED for %s - malformed counter %r "
+                            "(expected an integer 'n').", rec.serial, data.get("n"))
             return False
         if n <= rec.ws_last_n:
-            _logger.info("WS: hello replay from %s (n=%s <= last %s)",
-                         rec.serial, n, rec.ws_last_n)
+            _logger.warning(
+                "WS: hello REJECTED for %s - ANTI-REPLAY: n=%s <= last_seen_n=%s. "
+                "The device's counter is at or behind the stored watermark (a "
+                "prior/higher n was recorded, or the device rebooted to a lower "
+                "counter). NOT an auth failure. To recover on the bench, clear "
+                "ws_last_n on this endpoint (re-key or reset it below the "
+                "device's n).", rec.serial, n, rec.ws_last_n)
             return False
         expected = hmac.new(
             secret.encode(),
@@ -403,8 +417,12 @@ class PolimexWsMixin(models.AbstractModel):
             hashlib.sha256).hexdigest()
         auth = data.get("auth")
         if not (auth and hmac.compare_digest(expected, str(auth).lower())):
-            _logger.info("WS: firmware authenticity check did not pass for "
-                         "hello from %s", rec.serial)
+            _logger.warning(
+                "WS: hello REJECTED for %s - AUTH MISMATCH (HMAC over s|k|n did "
+                "not verify). Almost always the firmware's ODOO_WS_FW_SECRET "
+                "differs from Odoo's (%s), OR the 'k' term differs from the "
+                "stored key. s=%s k=%s n=%s. NOT a dropped/missing hello.",
+                rec.serial, WS_FW_SECRET_PARAM, wire_s, wire_k, n)
             return False
         # Adopt / TOFU / HEAL. A device with NO stored key (never provisioned) OR
         # the insecure '0000' placeholder adopts the HMAC-proven NON-zero key it
